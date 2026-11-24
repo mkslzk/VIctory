@@ -3579,7 +3579,25 @@ impl<'a> Lower<'a> {
                         Some(ResourceType::Srv | ResourceType::Uav),
                         11,
                     ) => Ok(self.s.title_handle()),
-                    _ => Err("a root UAV or typed root view"),
+                    // No used entry at all: the program never names the
+                    // descriptor as a resource, it only reads its dwords. A
+                    // raw view of the heap is exactly what those reads want,
+                    // so the missing kind is no obstacle.
+                    (RootType::Table | RootType::ResourceHeap, None, 11) => {
+                        Ok(self.s.title_handle())
+                    }
+                    _ => Err(match (rp.root, kind, props.0) {
+                        (RootType::Table | RootType::ResourceHeap, None, _) =>
+                            "a heap root: no used kind",
+                        (RootType::Table | RootType::ResourceHeap, Some(_), p) if p != 11 =>
+                            "a heap root: wants another view kind",
+                        (RootType::Table | RootType::ResourceHeap, Some(_), _) =>
+                            "a heap root: a sampler table",
+                        (RootType::Descriptor, Some(ResourceType::Uav), _) =>
+                            "a root descriptor: UAV",
+                        (RootType::Descriptor, _, _) => "a root descriptor: other kind",
+                        _ => "a descriptor whose root is not a descriptor",
+                    }),
                 }
             }
             Source::Phi { block, args } => {
