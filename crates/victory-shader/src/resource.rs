@@ -27,10 +27,18 @@ pub type Site = (usize, usize);
 pub struct Address {
     /// Index into the layout, or [`CODE`].
     pub param: usize,
-    /// Added modulo 2^32 (with carry into the high half of a root
-    /// descriptor's address).
+    /// The address's constant part, added modulo 2^32 (with carry into the
+    /// high half of a root descriptor's address); for a joined one (see
+    /// [`Address::join`]), the table entry it is known to land in.
     pub offset: u32,
+    /// A value the address adds to the parameter's own.
     pub dynamic: Option<Value>,
+    /// The value that picked this address among entries of one table
+    /// range (a phi, or an SCC select), when the program computes the
+    /// address as a whole instead of the parameter plus a value. Scalar
+    /// memory reads the load's own registers, so nothing of this is added:
+    /// it names the entry `offset` holds (see [`Resources::scalar`]).
+    pub join: Option<Value>,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -608,7 +616,7 @@ impl<'a> Tracer<'a> {
                     return Err("an offset from a root parameter");
                 }
                 extra.offset = extra.offset.wrapping_add(off);
-                self.address(lo, hi, extra)
+                self.address(lo, hi, extra, false)
             }
             _ => {
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
@@ -623,37 +631,66 @@ impl<'a> Tracer<'a> {
                         offset: off,
                         dynamic: None,
                     },
+                    false,
                 )
             }
         }
     }
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
-    /// immediate and offset register).
-    fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+    /// immediate and offset register). `joins` resolves an address that a
+    /// phi or an SCC select picked among one table's entries; only scalar
+    /// memory passes it, whose module reads the load's own registers.
+    fn address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: Sum,
+        joins: bool,
+    ) -> Result<Address, &'static str> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
-        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
-        if let Some(pc) = self.getpc(base) {
-            // A table in the code: the base is the next instruction's offset.
-            let high = pc.writes.get(1).map(|w| w.1);
-            if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
-                return Err("an address with an untracked high half");
+        let mut join = None;
+        let (param, offset) = match s.base {
+            Some(base) => {
+                if let Some(pc) = self.getpc(base) {
+                    // A table in the code: the base is the next instruction's offset.
+                    let high = pc.writes.get(1).map(|w| w.1);
+                    if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
+                        return Err("an address with an untracked high half");
+                    }
+                    return Ok(Address {
+                        param: CODE,
+                        offset: (pc.machine.offset as u32 + 4)
+                            .wrapping_add(s.offset)
+                            .wrapping_add(extra.offset),
+                        dynamic: s.dynamic.or(extra.dynamic),
+                        join: None,
+                    });
+                }
+                let reg =
+                    self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
+                let (param, _) = self
+                    .param_of(reg)
+                    .ok_or("an address not from a root parameter")?;
+                (param, s.offset.wrapping_add(extra.offset))
             }
-            return Ok(Address {
-                param: CODE,
-                offset: (pc.machine.offset as u32 + 4)
-                    .wrapping_add(s.offset)
-                    .wrapping_add(extra.offset),
-                dynamic: s.dynamic.or(extra.dynamic),
-            });
-        }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
-        let (param, _) = self
-            .param_of(reg)
-            .ok_or("an address not from a root parameter")?;
+            None => {
+                let Some(v) = s.dynamic else {
+                    return Err(self.why_no_base(None));
+                };
+                let entry = if joins { self.entry(v, &extra) } else { None };
+                match entry {
+                    Some((param, offset)) => {
+                        join = Some(v);
+                        (param, offset)
+                    }
+                    None => return Err(self.why_no_base(Some(v))),
+                }
+            }
+        };
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
@@ -665,7 +702,10 @@ impl<'a> Tracer<'a> {
         };
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
-        let dynamic = s.dynamic.or(extra.dynamic);
+        let dynamic = match join {
+            Some(_) => None,
+            None => s.dynamic.or(extra.dynamic),
+        };
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
@@ -673,9 +713,88 @@ impl<'a> Tracer<'a> {
         }
         Ok(Address {
             param,
-            offset: s.offset.wrapping_add(extra.offset),
-            dynamic: s.dynamic.or(extra.dynamic),
+            offset,
+            dynamic,
+            join,
         })
+    }
+
+    /// The layout entry a scalar memory address `v` names, and the entry it
+    /// is known to land in, when a phi or an SCC select chose among entries
+    /// of one table: every choice is one table parameter's heap address plus
+    /// a term that adds no other parameter, and every entry falls in the
+    /// same range of that table. `None` for any other computation (a join
+    /// the range cannot place, a loop-carried pointer whose entry is not
+    /// known at translation time, a root descriptor's address, which is a
+    /// view and no number).
+    fn entry(&self, v: Value, extra: &Sum) -> Option<(usize, u32)> {
+        let mut args: Vec<Term> = Vec::new();
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            args.extend(
+                self.p.blocks[b].phis[i]
+                    .args
+                    .iter()
+                    .copied()
+                    .map(Term::Value),
+            );
+        } else if let Some((_, [a, b])) = self.sop2(v, &["s_cselect_b32"]) {
+            // SCC set picks the first operand.
+            args.extend([a, b]);
+        }
+        if args.is_empty() {
+            return None;
+        }
+        let mut base = None;
+        let mut offsets = Vec::with_capacity(args.len());
+        for t in args {
+            let s = self.sum(t);
+            if s.dynamic.is_some() {
+                return None;
+            }
+            let b = s.base?;
+            if base.is_some_and(|x| x != b) {
+                return None;
+            }
+            base = Some(b);
+            offsets.push(s.offset.wrapping_add(extra.offset));
+        }
+        let reg = self.inputs[base?.0 as usize]?;
+        let (param, 0) = self.param_of(reg)? else {
+            return None;
+        };
+        if !matches!(
+            self.layout[param].root,
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+        ) {
+            return None;
+        }
+        // Every choice must fall in the same range of the table: the
+        // descriptor's kind comes from that range, and a load of entries
+        // of two ranges (an SRV and a UAV, say) is not one descriptor.
+        let user_data = self.layout[param].user_data;
+        let mut entry = None;
+        for off in &offsets {
+            let dword = off / 4;
+            let range = self
+                .layout
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.user_data == user_data && p.table_offset_dwords <= dword)
+                .max_by_key(|(_, p)| p.table_offset_dwords)
+                .map(|(i, _)| i)?;
+            if entry.is_some_and(|e| e != range) {
+                return None;
+            }
+            entry = Some(range);
+        }
+        let entry = entry?;
+        if !matches!(
+            self.layout[entry].root,
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+        ) {
+            return None;
+        }
+        Some((entry, *offsets.iter().min()?))
     }
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
@@ -762,7 +881,7 @@ impl<'a> Tracer<'a> {
             return Err("an offset from a root parameter");
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
-        self.address(lo, hi, extra)
+        self.address(lo, hi, extra, true)
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
@@ -834,6 +953,7 @@ impl<'a> Tracer<'a> {
                     offset: 0,
                     dynamic: None,
                 },
+                false,
             )?;
             return Ok(Source::Built {
                 address,
@@ -1988,6 +2108,7 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            join: None,
         }
     }
 
@@ -2240,6 +2361,111 @@ pub(crate) mod tests {
             ShaderError::Unsupported {
                 offset: 0,
                 what: "an address in an SGPR that is no root parameter"
+            }
+        );
+    }
+
+    /// A compute shader whose table pointer a branch joins: each path adds
+    /// a different entry's offset to the table's heap address in s9, and one
+    /// load at 0x1c reads the join (`s2` is a phi there, `s3` is 0 on both).
+    const A_TABLE_POINTER_JOINED_BY_CONTROL_FLOW: &[u32] = &[
+        0xBE82_0309, // s_mov_b32 s2, s9
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0002, // s_cbranch_scc1 -> 0x18
+        0x8002_9002, // s_add_u32 s2, s2, 0x10
+        0xBF82_0001, // s_branch -> 0x1c
+        0x8002_C002, // 0x18: s_add_u32 s2, s2, 0x40
+        0xF408_0001,
+        0xFA00_0000, // 0x1c: s_load_dwordx4 s[0:3], s[2:3], 0
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn a_table_pointer_joined_by_control_flow_is_an_entry_of_its_table() {
+        // The family the title's compute shaders hit as "an address from a
+        // phi": the compiler adds each entry's offset on its own path, so
+        // the join is the table's heap address plus one entry's offset. The
+        // load reads its own registers, which hold exactly that number, so
+        // the address is the entry and nothing is guessed.
+        let r = track_words(
+            A_TABLE_POINTER_JOINED_BY_CONTROL_FLOW,
+            &[param(Table, 9, 1)],
+            HwStage::Cs,
+        );
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset, a.dynamic), (0, 0x10, None));
+        assert!(a.join.is_some(), "{a:?}");
+    }
+
+    #[test]
+    fn a_table_pointer_selected_by_scc_is_an_entry_of_its_table() {
+        // The same choice without a branch: s_cselect_b32 picks the first
+        // operand where SCC is set, the second where it is clear.
+        let r = track_words(
+            &[
+                0x8004_A009, // s_add_u32 s4, s9, 0x20
+                0x8005_C009, // s_add_u32 s5, s9, 0x40
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0x8502_0405, // s_cselect_b32 s2, s4, s5
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0001,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], 0
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Cs,
+        );
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset, a.dynamic), (0, 0x20, None));
+        assert!(a.join.is_some(), "{a:?}");
+    }
+
+    #[test]
+    fn a_join_that_picks_entries_of_two_ranges_is_refused() {
+        // The table's ranges split at dword 16: 0x10 is an entry of the
+        // first and 0x40 of the second. Their descriptors are not one kind,
+        // so the address stays untraced rather than taking one range's.
+        let first = param(Table, 9, 1);
+        let mut second = param(Table, 9, 1);
+        second.table_offset_dwords = 16;
+        let code: Vec<u8> = A_TABLE_POINTER_JOINED_BY_CONTROL_FLOW
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[first, second], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0x1c,
+                what: "an address from a phi"
+            }
+        );
+    }
+
+    #[test]
+    fn an_address_through_a_shift_is_no_table_entry() {
+        // A computation that is not the table plus a term adds no entry:
+        // shifting the heap address is not arithmetic on an entry offset.
+        let code: Vec<u8> = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0x8F02_8502, // s_lshl_b32 s2, s2, 5
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], 0
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 9, 1)], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0x0c,
+                what: "an address not from a root parameter"
             }
         );
     }
