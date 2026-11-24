@@ -2949,18 +2949,32 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar memory read as data"),
         };
         // How the program uses the descriptor tells the view's kind.
-        let use_at = self
+        // Prefer an image or vector-buffer use over `s_buffer_load_dword*`,
+        // since those encode typed/structured properties directly.
+        let mut uses = self
             .x
             .res
             .descriptors
             .iter()
             .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
+            .filter_map(|d| {
                 d.source.leaves().into_iter().find_map(|l| match *l {
                     Source::Loaded { load, first } if load == site => Some((d.site, first)),
                     _ => None,
                 })
             });
+        let mut fallback = None;
+        let use_at = loop {
+            let Some((at, first)) = uses.next() else {
+                break fallback;
+            };
+            match &self.x.p.blocks[at.0].insts[at.1].fields {
+                Fields::Image { .. } | Fields::Buffer { .. } => break Some((at, first)),
+                _ => {
+                    fallback.get_or_insert((at, first));
+                }
+            }
+        };
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };
@@ -2999,6 +3013,15 @@ impl<'a> Lower<'a> {
                     return Err("a constant buffer's descriptor read as data");
                 }
                 (props, None)
+            }
+            Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
+                if !matches!(
+                    used.map(|u| u.kind),
+                    Some(ResourceType::Srv | ResourceType::Uav)
+                ) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                ((11 | u, 0), None)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -4158,7 +4181,27 @@ impl<'a> Lower<'a> {
             }
             "v_cndmask_b32" => {
                 let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => inst.read(Reg::S(code)),
+                    Some(&Operand::Scalar { .. })
+                    | Some(&Operand::Const(128))
+                    | Some(&Operand::Literal(0)) => {
+                        return if v.abs != 0 || v.neg != 0 {
+                            let a = f(self, 0)?;
+                            float(self, a)
+                        } else {
+                            let a = s(self, 0)?;
+                            int(self, a)
+                        };
+                    }
+                    Some(&Operand::Const(193)) => {
+                        return if v.abs != 0 || v.neg != 0 {
+                            let bb = f(self, 1)?;
+                            float(self, bb)
+                        } else {
+                            let bb = s(self, 1)?;
+                            int(self, bb)
+                        };
+                    }
                     _ => None,
                 };
                 let m = mask
@@ -4208,6 +4251,32 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                let dst_v = match v.dst {
+                    Some(Operand::Scalar { code, .. }) if code != NULL => inst.write(Reg::S(code)),
+                    _ => None,
+                };
+                if self.is_mask(dst_v) || dst_v.is_some_and(|d| self.x.st.highs.contains_key(&d)) {
+                    return Err(LANE_MASK);
+                }
+                if let [Operand::Vector { reg, .. }, lane_op] = v.src[..]
+                    && let Some(lane_idx) = crate::resource::lane_of(lane_op)
+                    && let Some(src_v) = inst.read(Reg::V(reg))
+                    && let Some(spilled) = self.spilled_scalar(src_v, lane_idx)
+                {
+                    match spilled {
+                        crate::resource::Moved::Const(x) => {
+                            self.cross_lane(false)?;
+                            let v = self.s.m.i32(x);
+                            return int(self, v);
+                        }
+                        crate::resource::Moved::Value(sv) => {
+                            if let Some(&Val::I32(x)) = self.vals.get(&sv) {
+                                self.cross_lane(false)?;
+                                return int(self, x);
+                            }
+                        }
+                    }
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
@@ -4265,6 +4334,27 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Traces lane `lane` of VGPR `v` back through `v_writelane_b32` spills.
+    fn spilled_scalar(&self, v: Value, lane: u32) -> Option<crate::resource::Moved> {
+        let p = self.x.p;
+        crate::resource::spilled_lane(
+            p,
+            &|val| {
+                let &b = self.def_block.get(&val)?;
+                p.blocks[b]
+                    .insts
+                    .iter()
+                    .find(|i| i.writes.iter().any(|w| w.1 == val))
+            },
+            &|val| self.phi_at.get(&val).copied(),
+            v,
+            lane,
+            &mut Vec::new(),
+        )
+        .ok()
+        .flatten()
+    }
+
     /// A 64-bit source (a register pair; inline constants sign-extend).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -4280,11 +4370,7 @@ impl<'a> Lower<'a> {
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
-            let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
-            let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
-            let k32 = l.s.m.int_const(i64t, 32);
-            let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
-            Ok(l.s.m.bin(c, Bin::Or, lo, hi))
+            Ok(l.pack64(lo, hi))
         };
         match op {
             Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
@@ -4301,6 +4387,18 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// Packs low and high 32-bit dwords into an i64.
+    fn pack64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -5679,11 +5777,13 @@ impl<'a> Lower<'a> {
                 return Err("a 16-bit image atomic");
             }
             // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            let wide = if *dmask == if code == u32::MAX { 3 } else { 1 } {
+                false
+            } else if *dmask == if code == u32::MAX { 15 } else { 3 } {
+                true
+            } else {
+                return Err("an image atomic mask");
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5692,29 +5792,59 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
+            let words = if code == u32::MAX { 2 } else { 1 } * if wide { 2 } else { 1 };
+            let vals = self.vgprs(inst, data, words)?;
+            let mut value = if wide {
+                self.pack64(vals[0], vals[1])
+            } else {
+                vals[0]
+            };
             if op == "sub" {
-                let z = self.s.m.i32(0);
+                let z = if wide {
+                    let i64t = self.s.m.int(64);
+                    self.s.m.int_const(i64t, 0)
+                } else {
+                    self.s.m.i32(0)
+                };
                 value = self.s.m.bin(c, Bin::Sub, z, value);
             }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let old = if wide {
+                let i64t = self.s.m.int(64);
+                match (inst.read(Reg::V(reg)), inst.read(Reg::V(reg + 1))) {
+                    (Some(lo), Some(hi)) if cache.glc => {
+                        let (lo, hi) = (self.i32_of(lo)?, self.i32_of(hi)?);
+                        self.pack64(lo, hi)
+                    }
+                    _ => self.s.m.int_const(i64t, 0),
+                }
+            } else {
+                match inst.read(Reg::V(reg)) {
+                    Some(v) if cache.glc => self.i32_of(v)?,
+                    _ => self.s.m.i32(0),
+                }
             };
             let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED | flags::ATOMIC_INT64_HEAP;
+            }
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
+            let ty = if wide { self.s.m.int(64) } else { self.s.t.i32 };
+            let sfx = if wide { "i64" } else { "i32" };
             let mut args = vec![h];
             let r = if code == u32::MAX {
                 // cmpswap: data is (new, compare).
+                let cmp = if wide {
+                    self.pack64(vals[2], vals[3])
+                } else {
+                    vals[1]
+                };
                 args.extend(cs);
-                args.extend([vals[1], vals[0]]);
+                args.extend([cmp, value]);
                 self.s.op(
                     self.cur,
-                    "atomicCompareExchange.i32",
+                    &format!("atomicCompareExchange.{sfx}"),
                     Attr::NoUnwind,
-                    i32t,
+                    ty,
                     79,
                     &args,
                 )
@@ -5722,12 +5852,24 @@ impl<'a> Lower<'a> {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
                 args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                self.s.op(
+                    self.cur,
+                    &format!("atomicBinOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    78,
+                    &args,
+                )
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }
@@ -7434,5 +7576,150 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn sixty_four_bit_image_atomics_lower_and_validate() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0501,
+            0xFA00_0000, // s_load_dwordx8 s[20:27], s[2:3], null
+            0xF05C_130A,
+            0x0005_060D,
+            0x0000_0004, // image_atomic_umax v[6:7], [v13,v4], s[20:27] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 9,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 9,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let mut lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(None) {
+            v.validate(&mut lowered.dxil).unwrap();
+        }
+        let _ = &mut lowered;
+    }
+
+    #[test]
+    fn spilled_inactive_mask_does_not_poison_other_lanes() {
+        let words = [
+            0xBE80_0385, // s_mov_b32 s0, 5
+            0x8902_C17E, // s_xor_b32 s2, exec_lo, -1
+            0xD761_0000,
+            0x0001_0002, // v_writelane_b32 v0, s2, 0
+            0xD761_0000,
+            0x0001_0200, // v_writelane_b32 v0, s0, 1
+            0xD760_0004,
+            0x0001_0300, // v_readlane_b32 s4, v0, 1
+            0xBF06_8504, // s_cmp_eq_u32 s4, 5
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE85_0380, // s_mov_b32 s5, 0
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).unwrap();
+    }
+
+    #[test]
+    fn descriptor_data_handles_s_buffer_load_srv() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF85_0002, // s_cbranch_scc1 -> s_endpgm
+            0xF420_0100,
+            0xFA00_0000, // s_buffer_load_dword s4, s[0:3], null
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 9,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 9,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
     }
 }

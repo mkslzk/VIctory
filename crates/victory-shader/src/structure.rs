@@ -658,6 +658,37 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// If `v` is written by `v_readlane_b32` at a constant lane, trace that
+    /// lane back through `v_writelane_b32` (and VGPR phis) to the spilled scalar.
+    fn readlane_spilled(&self, v: Value) -> Option<crate::resource::Moved> {
+        let &(b, i) = self.defs.get(&v)?;
+        let inst = &self.p.blocks[b].insts[i];
+        if inst.name() != "v_readlane_b32" {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let [Operand::Vector { reg, .. }, lane] = f.src[..] else {
+            return None;
+        };
+        let lane = crate::resource::lane_of(lane)?;
+        crate::resource::spilled_lane(
+            self.p,
+            &|val| {
+                self.defs
+                    .get(&val)
+                    .map(|&(b, i)| &self.p.blocks[b].insts[i])
+            },
+            &|val| self.phis.get(&val).copied(),
+            inst.read(Reg::V(reg))?,
+            lane,
+            &mut Vec::new(),
+        )
+        .ok()
+        .flatten()
+    }
+
     fn exec(&mut self, inst: &Inst) -> Bool {
         match self.key(|r| inst.read(r), EXEC) {
             Some(k) => self.mask(k).0,
@@ -678,6 +709,52 @@ impl<'a> Lanes<'a> {
         let (m, derived) = match self.join(k) {
             Some(join) => join,
             None => {
+                use crate::resource::Moved;
+                let spilled = if !p.wave64 {
+                    match self.readlane_spilled(k.0) {
+                        Some(Moved::Value(s)) => Some(self.mask((s, s))),
+                        Some(Moved::Const(c)) => {
+                            let m = match c {
+                                0 => Bool::FALSE,
+                                u32::MAX => Bool::TRUE,
+                                _ => self.b.atom(Atom::Constant(u64::from(c)), 0),
+                            };
+                            Some((m, false))
+                        }
+                        None => None,
+                    }
+                } else {
+                    match (self.readlane_spilled(k.0), self.readlane_spilled(k.1)) {
+                        (Some(Moved::Value(s_lo)), Some(Moved::Value(s_hi))) => {
+                            Some(self.mask((s_lo, s_hi)))
+                        }
+                        (Some(Moved::Const(lo)), Some(Moved::Const(hi))) => {
+                            let v = u64::from(lo) | (u64::from(hi) << 32);
+                            let m = match v {
+                                0 => Bool::FALSE,
+                                u64::MAX => Bool::TRUE,
+                                _ => self.b.atom(Atom::Constant(v), 0),
+                            };
+                            Some((m, false))
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some((m, derived)) = spilled {
+                    if derived
+                        && let Some(Moved::Value(s_lo)) = self.readlane_spilled(k.0)
+                        && self.active.contains(&s_lo)
+                    {
+                        self.active.insert(k.0);
+                    }
+                    let cache = if derived {
+                        &mut self.masks
+                    } else {
+                        &mut self.other
+                    };
+                    cache.insert(k, m);
+                    return (m, derived);
+                }
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
                 let m = match (lo, hi) {
@@ -922,7 +999,11 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        let restored = self.defs.get(&k.0).is_some_and(|&(b, i)| {
+                            self.p.blocks[b].insts[i].name() == "v_readlane_b32"
+                        });
+                        takes_mask |=
+                            self.masks.contains_key(&k) || (phi || restored) && self.mask(k).1;
                     }
                 }
                 let touches_exec =
@@ -1230,5 +1311,29 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn spilled_lane_masks_are_tracked() {
+        let p = build(
+            &[
+                0x8500_807E, // s_cselect_b32 s0, exec_lo, 0
+                0xD761_0000,
+                0x0001_0000, // v_writelane_b32 v0, s0, 0
+                0xD760_0002,
+                0x0001_0100, // v_readlane_b32 s2, v0, 0
+                0xD501_0022,
+                0x0009_00F2, // v_cndmask_b32 v34, 1.0, 0, s2
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let readlane_val = p.blocks[0].insts[2].writes[0].1;
+        assert!(
+            s.masks.contains_key(&readlane_val),
+            "restored mask should be tracked in masks: {:?}",
+            s.masks
+        );
     }
 }
