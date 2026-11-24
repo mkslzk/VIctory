@@ -49,6 +49,10 @@ pub(crate) struct Lowered {
     /// The props each buffer handle was declared with (kind, stride).
     #[cfg(test)]
     pub views: Vec<(u32, u32)>,
+
+    /// Test builds: typed loads assembled from a dword-aligned pair.
+    #[cfg(test)]
+    pub unaligned_typed_loads: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -930,6 +934,9 @@ impl<'a> Lower<'a> {
         let title = self.s.title.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            #[cfg(test)]
+            #[cfg(test)]
+            unaligned_typed_loads: self.s.unaligned_typed_loads,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -3252,6 +3259,36 @@ impl<'a> Lower<'a> {
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
+        } else if let Some(at) = self.s.m.int_value(off) {
+            if at % 4 == 0 {
+                load(self, off, total / 32)
+            } else {
+                // A value of several dwords at a byte offset inside one: the
+                // console reads the bytes the address names, so each word is
+                // taken from the two dword-aligned words around it. Reading
+                // at the byte address itself would promise the host an
+                // alignment the console does not have, and a host that
+                // believes it can hand back zeros (`notes/vtx.md`: a
+                // position fetched at an odd byte offset collapsing every
+                // vertex to the origin).
+                #[cfg(test)]
+                {
+                    self.s.unaligned_typed_loads += 1;
+                }
+                let n = (total / 32) as usize;
+                let shift = (at % 4) as u32 * 8;
+                let aligned = self.s.m.i32((at & !3) as u32);
+                let sh = self.s.m.i32(shift);
+                let up = self.s.m.i32(32 - shift);
+                let raw = load(self, aligned, n as u32 + 1);
+                (0..n)
+                    .map(|k| {
+                        let lo = self.s.m.bin(c, Bin::LShr, raw[k], sh);
+                        let hi = self.s.m.bin(c, Bin::Shl, raw[k + 1], up);
+                        self.s.m.bin(c, Bin::Or, lo, hi)
+                    })
+                    .collect()
+            }
         } else {
             load(self, off, total / 32)
         };
@@ -6085,7 +6122,7 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -6155,8 +6192,12 @@ impl<'a> Lower<'a> {
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            // Gradients per direction: a cube's are in face space (s, t).
+            let gspatial = if kind == 5 { 2 } else { spatial };
+            let grads = if op == 63 { 2 * gspatial } else { 0 };
             let mut cs = vec![fu; 4];
+            // A cube sample's face coordinates (s, t, face), for gradients.
+            let mut face_coords = None;
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
                 if *a16 {
@@ -6171,10 +6212,11 @@ impl<'a> Lower<'a> {
                 *slot = to_float(self, x);
             }
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                face_coords = Some((cs[0], cs[1], cs[2]));
                 cs[..3].copy_from_slice(&dir);
             }
             if *unorm {
@@ -6266,15 +6308,40 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    if let Some((s0, t0, face)) = face_coords {
+                        // Face-space gradients: the direction is affine in s
+                        // and t on one face, so a step's direction less the
+                        // sample's is its gradient (the constants cancel).
+                        for (k, at) in [(0, 0), (1, 2)] {
+                            let ds = addr_val(self, first + at)?;
+                            let ds = to_float(self, ds);
+                            let dt = addr_val(self, first + at + 1)?;
+                            let dt = to_float(self, dt);
+                            let s1 = self.s.m.bin(c, Bin::Add, s0, ds);
+                            let t1 = self.s.m.bin(c, Bin::Add, t0, dt);
+                            let stepped = self.cube_direction(s1, t1, face);
+                            for (n, &d) in stepped.iter().enumerate() {
+                                g[3 * k + n] = self.s.m.bin(c, Bin::Sub, d, cs[n]);
+                            }
+                        }
+                    }
+                    for k in 0..if face_coords.is_some() { 0 } else { spatial } {
                         let x = addr_val(self, first + k)?;
                         g[k] = to_float(self, x);
                         let y = addr_val(self, first + spatial + k)?;
                         g[3 + k] = to_float(self, y);
                     }
+                    // `_cl`: the level-of-detail clamp follows the
+                    // coordinates (and the array slice).
+                    let clamp = if name.ends_with("_cl") {
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -7594,6 +7661,150 @@ mod tests {
         assert_eq!(l.root_srvs, [0]);
     }
 
+    /// `v_mov_b32 vdst, src0` (`src0`: 128 is the inline zero).
+    fn v_mov(vdst: u8, src0: u16) -> u32 {
+        0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | (src0 as u32 & 0x1FF)
+    }
+
+    /// `ds_write_b32 v[addr], v[data]`.
+    fn ds_write_b32(addr: u8, data: u8) -> [u32; 2] {
+        [0xD834_0000, u32::from(addr) | u32::from(data) << 8]
+    }
+
+    /// A buffer access: MUBUF (`mtbuf` false, opcode in bits 18-25, a
+    /// resource and optional `idxen`/`offen`) or MTBUF (`mtbuf` true, opcode
+    /// in bits 15-18, the format in bits 19-25), `srsrc` the first of four
+    /// resource SGPRs, `vdata`/`vaddr` VGPRs and `offset` a byte offset.
+    #[allow(clippy::too_many_arguments)]
+    fn buffer(
+        opcode: u16,
+        mtbuf: bool,
+        format: u8,
+        offset: u16,
+        offen: bool,
+        idxen: bool,
+        vdata: u8,
+        vaddr: u8,
+        srsrc: u8,
+    ) -> [u32; 2] {
+        let class = if mtbuf { 0x3A } else { 0x38 };
+        let op_shift = if mtbuf { 16 } else { 18 };
+        [
+            class << 26
+                | u32::from(opcode & if mtbuf { 0x7 } else { 0x7F }) << op_shift
+                | u32::from(format) << 19
+                | u32::from(offen) << 12
+                | u32::from(idxen) << 13
+                | u32::from(offset),
+            // soffset is the inline zero, TFE and GLC clear; MTBUF keeps
+            // the top bit of its opcode here.
+            0x80 << 24
+                | u32::from(if mtbuf { opcode >> 3 } else { 0 }) << 21
+                | u32::from(srsrc >> 2) << 16
+                | u32::from(vdata) << 8
+                | u32::from(vaddr),
+        ]
+    }
+
+    /// A program that reads the descriptor at table entry 0 into `s[8:11]`,
+    /// runs `fetch` (VGPRs from 0, its address in v3) and writes its VGPRs
+    /// to LDS: the three positions of a vertex fetch, or four channels.
+    fn fetch_program(fetch: [u32; 2], channels: u8) -> Vec<u32> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000,              // s_load_dwordx4 s[8:11], s[4:5], null
+            v_mov(3, 128),            // v_mov_b32 v3, 0 (the fetch's address)
+            v_mov(channels + 1, 128), // v_mov_b32 v5, 0 (the LDS address)
+        ];
+        words.extend_from_slice(&fetch);
+        for k in 0..channels {
+            words.extend_from_slice(&ds_write_b32(channels + 1, k));
+        }
+        words.push(S_ENDPGM);
+        words
+    }
+
+    /// The descriptor at table entry 0: a typed or raw SRV of `stride` (0:
+    /// none), read as `dwords` dwords.
+    fn fetch_tables(stride: u32, dwords: u8) -> (Vec<RootParam>, Vec<UsedResource>) {
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride,
+            dwords,
+            user_data: 0,
+            slot: 0,
+        }];
+        (layout, used)
+    }
+
+    #[test]
+    fn every_buffer_format_names_its_bits_and_numbers() {
+        // Every number names a format, 1 to 77, and no number past that
+        // does: the element sizes the typed fetches read follow from these.
+        for format in 1..=77u8 {
+            let (bits, _) = buffer_format(format).unwrap_or_else(|| panic!("format {format}"));
+            let total: u32 = bits.iter().sum();
+            assert_eq!(total % 8, 0, "format {format}: {bits:?} is whole bytes");
+            assert!(
+                total == 8 || total == 16 || total >= 32,
+                "format {format}: {bits:?} is a dword or a byte/half inside one"
+            );
+        }
+        assert_eq!(buffer_format(78), None);
+        // The vertex fetch shapes: float3 is 12 bytes (16_16_16_16 comes
+        // first, at 65), half2 and unorm8x4 are 4.
+        let bytes = |f| -> u32 { buffer_format(f).unwrap().0.iter().sum::<u32>() / 8 };
+        assert_eq!(bytes(74), 12, "32_32_32_FLOAT");
+        assert_eq!(bytes(24), 4, "16_16_SNORM");
+        assert_eq!(bytes(56), 4, "8_8_8_8_UNORM");
+    }
+
+
+    #[test]
+    fn a_typed_fetch_inside_a_dword_reads_the_pair_around_it() {
+        // `tbuffer_load_format_xyz` at byte offset 33: the console reads
+        // the bytes at 33, so the host reads the dword-aligned pair and
+        // shifts (a dword read promised at 33 can return zeros).
+        let odd = buffer(0x002, true, 74, 33, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(odd, 3), layout, used).unwrap();
+        assert_eq!(l.unaligned_typed_loads, 1);
+        // The same fetch on a dword boundary is one plain read.
+        let even = buffer(0x002, true, 74, 32, false, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let l = lower_with(&fetch_program(even, 3), layout, used).unwrap();
+        assert_eq!(l.unaligned_typed_loads, 0);
+    }
+
+    #[test]
+    fn a_typed_fetch_of_no_format_is_refused() {
+        // Format 0 is not a format: the fetch must stop rather than read
+        // whatever the descriptor holds.
+        let fetch = buffer(0x002, true, 0, 0, true, false, 0, 3, 8);
+        let (layout, used) = fetch_tables(0, 4);
+        let err = match lower_with(&fetch_program(fetch, 3), layout, used) {
+            Err(e) => e,
+            Ok(_) => panic!("a fetch of format 0 lowered"),
+        };
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "a buffer format",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let range = |kind, user_data, slot| UsedResource {
@@ -7632,6 +7843,70 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    #[test]
+    fn a_gradient_sample_with_a_level_clamp_reads_the_clamp_after_the_coordinates() {
+        // image_sample_d_cl on a 2D texture: x gradients, y gradients,
+        // coordinates (two each), then the clamp (1.0) in v8.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], null
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_0280, // v_mov_b32 v6, 0
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7E10_02F2, // v_mov_b32 v8, 1.0
+            0xF08C_0108,
+            0x0082_0102, // image_sample_d_cl v1, v[2:8], s[8:15], s[16:19] dmask:0x1 dim:2D
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
+    fn a_cube_gradient_sample_takes_face_space_gradients() {
+        // image_sample_d_cl on a cube: two face-space gradients per
+        // direction (v2..v5), face coordinates s, t (1.5) and face 0
+        // (v6..v8), then the clamp (1.0) in v9.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], null
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_02FF,
+            0x3FC0_0000, // v_mov_b32 v6, 1.5
+            0x7E0E_02FF,
+            0x3FC0_0000, // v_mov_b32 v7, 1.5
+            0x7E10_0280, // v_mov_b32 v8, 0
+            0x7E12_02F2, // v_mov_b32 v9, 1.0
+            0xF08C_0118,
+            0x0082_0102, // image_sample_d_cl v1, v[2:9], s[8:15], s[16:19] dmask:0x1 dim:CUBE
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        lower_with(&words, layout, used).unwrap();
     }
 
     /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.
