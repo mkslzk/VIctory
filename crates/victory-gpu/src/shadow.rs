@@ -24,6 +24,9 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+#[cfg(test)]
+mod snapshot_tests;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -40,39 +43,96 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// The copy's bytes before the submission ran, where its shaders write:
+    /// what the GPU wrote differs. Parts of the copy that do not overlap, in
+    /// order, with where each starts in [`SNAPSHOTS`].
+    before: Mutex<Vec<Part>>,
 }
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
-fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+/// `[from, to)` of a copy, kept from `at` of [`SNAPSHOTS`]' bytes on.
+#[derive(Clone, Copy)]
+struct Part {
+    from: usize,
+    to: usize,
+    at: usize,
 }
 
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
-fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
+/// The running submission's snapshots, one after the other: in reused
+/// memory (fresh memory costs page faults), emptied with its last part.
+struct Snapshots {
+    bytes: Vec<u8>,
+    parts: usize,
+}
+
+static SNAPSHOTS: Mutex<Snapshots> = Mutex::new(Snapshots {
+    bytes: Vec::new(),
+    parts: 0,
+});
+
+fn snapshots() -> std::sync::MutexGuard<'static, Snapshots> {
+    SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Gives up the snapshots of `parts`.
+fn forget(parts: &mut Vec<Part>) {
+    let mut snapshots = snapshots();
+    snapshots.parts -= parts.len();
+    parts.clear();
+    if snapshots.parts == 0 {
+        snapshots.bytes.clear();
     }
+}
+
+impl Drop for Shadow {
+    /// With a range not copied back (its list was reset meanwhile).
+    fn drop(&mut self) {
+        forget(self.before.get_mut().unwrap_or_else(|e| e.into_inner()));
+    }
+}
+
+/// What `parts` (in order, not overlapping) leave out of `[from, to)`.
+fn uncovered(parts: &[Part], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut gaps = Vec::new();
+    let mut at = from;
+    for p in &parts[parts.partition_point(|p| p.to <= from)..] {
+        if p.from >= to {
+            break;
+        }
+        if p.from > at {
+            gaps.push((at, p.from));
+        }
+        at = at.max(p.to);
+    }
+    if at < to {
+        gaps.push((at, to));
+    }
+    gaps
+}
+
+/// The bytes `parts` keep of `[from, to)`, from one part or put together in
+/// `room`; `None` if they do not cover it.
+fn kept<'a>(
+    parts: &[Part],
+    bytes: &'a [u8],
+    (from, to): (usize, usize),
+    room: &'a mut Vec<u8>,
+) -> Option<&'a [u8]> {
+    let parts = &parts[parts.partition_point(|p| p.to <= from)..];
+    if let Some(p) = parts.first()
+        && p.from <= from
+        && to <= p.to
+    {
+        return Some(&bytes[p.at + (from - p.from)..][..to - from]);
+    }
+    room.clear();
+    for p in parts {
+        let at = from + room.len();
+        if at >= to || p.from > at {
+            break;
+        }
+        room.extend_from_slice(&bytes[p.at + (at - p.from)..][..p.to.min(to) - at]);
+    }
+    (room.len() == to - from).then_some(&room[..])
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -144,40 +204,31 @@ impl Shadow {
 
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// each byte once per submission, however many ranges declare it, and
+    /// none between them (the world declares ranges apart from each other,
+    /// and overlapping ones, in its 174 MB heap dozens of times; keeping all
+    /// from the first to the last took 10 times the bytes).
     pub(crate) fn writing(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
+        let gaps = uncovered(&before, from, to);
+        if gaps.is_empty() {
             return;
         }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
-            }
-            None => grown.extend_from_slice(host(start, end)),
+        let mut snapshots = snapshots();
+        for (from, to) in gaps {
+            // SAFETY: inside the mapping.
+            let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+            let at = snapshots.bytes.len();
+            snapshots.bytes.extend_from_slice(host);
+            snapshots.parts += 1;
+            before.push(Part { from, to, at });
         }
-        *before = Some((start, grown));
+        before.sort_unstable_by_key(|p| p.from);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -188,20 +239,17 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
-        {
-            let before = &before[from - taken..to - taken];
+        if from < to {
+            let snapshots = snapshots();
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
+            let mut room = Vec::new();
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -209,7 +257,10 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let Some(old) = kept(&before, &snapshots.bytes, (at, at + n), &mut room) else {
+                    at += n;
+                    continue;
+                };
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
@@ -248,13 +299,11 @@ impl Shadow {
             }
         }
         // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // submission runs at a time), and the snapshots with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
+        if pending.is_empty() {
+            forget(&mut before);
         }
         written
     }
