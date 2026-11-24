@@ -632,7 +632,11 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
             bools: self.b,
             exits,
@@ -1042,6 +1046,15 @@ impl<'a> Lanes<'a> {
                     } else {
                         ne
                     };
+                    self.scc_lane.insert(scc, m);
+                }
+                // `s_bcnt1` of a mask: SCC is "some lane is set", as for a
+                // mask operation.
+                if takes_mask
+                    && name.strip_prefix("s_bcnt1_i32_b") == Some(width)
+                    && let (Some(scc), [a]) = (inst.write(Reg::Scc), &src[..])
+                    && let Some((m, _)) = self.operand(inst, a)
+                {
                     self.scc_lane.insert(scc, m);
                 }
             }
