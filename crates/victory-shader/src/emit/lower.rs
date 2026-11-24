@@ -3152,13 +3152,68 @@ impl<'a> Lower<'a> {
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
-                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                    // Not rebuilt from the view's dimensions: the console's
+                    // dwords for it are the descriptor's own bytes, so read
+                    // them through the window onto the heap. A root
+                    // descriptor has no window, and keeps the refusal.
+                    let mem = self.descriptor_dword(site, k);
+                    match mem {
+                        Ok(x) => self.write(inst, Reg::S(code + k as u8), x, None),
+                        Err(_) => {
+                            if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                                // Which dword the host cannot rebuild decides
+                                // what a fix needs: a heap slot's first three
+                                // dwords hold the runtime's view tag, later
+                                // ones the title's own bytes.
+                                let why: Why = match k.wrapping_sub(u32::from(first)) {
+                                    0 => "a descriptor's dword 0 read as data",
+                                    1 => "a descriptor's dword 1 read as data",
+                                    2 => "a descriptor's dword 2 read as data",
+                                    3 => "a descriptor's dword 3 read as data",
+                                    _ => OTHER,
+                                };
+                                self.vals.insert(v, Val::Missing(why));
+                            }
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Dword `k` of a descriptor the code reads as numbers: the console's value
+    /// is the descriptor's own byte, read through the window onto its heap (see
+    /// [`Self::handle`]). A descriptor that comes from a root parameter has no
+    /// window, so this refuses and the caller keeps its report.
+    fn descriptor_dword(&mut self, site: Site, k: u32) -> Result<V, Why> {
+        let address = *self
+            .scalar
+            .get(&site)
+            .ok_or("an untracked descriptor load")?;
+        let built = Source::Built {
+            address,
+            bits: 0,
+            words: [0, 0],
+        };
+        let (base, extra) = self.built_offset(&built)?;
+        let h = self.handle(site, &built, false, (11, 0))?;
+        let mut off = self.s.m.i32(base + 4 * k);
+        if let Some(x) = extra {
+            off = self.s.m.bin(self.cur, Bin::Add, off, x);
+        }
+        let u = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            self.cur,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, off, u, mask, align],
+        );
+        Ok(self.s.m.extract(self.cur, r, 0))
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -7636,9 +7691,11 @@ mod tests {
         };
         let l = lower_with(&words, layout(), used()).unwrap();
         assert!(!l.views.is_empty());
+        // The descriptor's own use is a structured view of the recorded stride;
+        // reading its dwords as numbers goes through the raw window instead.
         assert!(
-            l.views.iter().all(|&v| v == (12, 4)),
-            "a structured view of the recorded stride: {:?}",
+            l.views.iter().all(|&v| v == (12, 4) || v == (11, 0)),
+            "structured views of the recorded stride, and the raw window: {:?}",
             l.views
         );
     }
