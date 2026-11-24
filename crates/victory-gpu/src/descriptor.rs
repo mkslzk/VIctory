@@ -142,13 +142,20 @@ impl Heap {
             // memory: ours, or the title's in the placement it gave).
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             unsafe { std::ptr::copy_nonoverlapping(self.start as *const u8, data, len as usize) };
-            Some(Bytes {
+            let copied = Bytes {
                 buffer,
                 data,
                 gpu,
                 start: self.start,
                 len,
-            })
+            };
+            // The heap's own bytes hold our tag where a view was recorded:
+            // each such slot gets the descriptor's own dwords (see
+            // [`dwords`]).
+            for index in 0..self.desc.count {
+                self.view_dwords(&copied, index, step);
+            }
+            Some(copied)
         });
         let copied = copied.as_ref()?;
         Some((copied.buffer.clone(), copied.gpu))
@@ -175,6 +182,40 @@ impl Heap {
                 step as usize,
             )
         };
+        // The copy followed the heap, tag and all: the descriptor's own
+        // dwords follow (see [`dwords`]).
+        self.view_dwords(copied, index, step);
+    }
+
+    /// Writes over the tag [`record`] left in a slot's copy the descriptor
+    /// dwords the slot's view determines (see [`dwords`]), so that a shader
+    /// reading them as numbers reads the descriptor and not our bookkeeping.
+    /// A slot no view names keeps the heap's own bytes.
+    #[cfg(windows)]
+    fn view_dwords(&self, copied: &Bytes, index: u32, step: u64) {
+        let at = u64::from(index) * step;
+        if at + step > copied.len {
+            return;
+        }
+        // SAFETY: the slot lies in the heap's memory, whose first dword is
+        // our tag when a view was recorded there.
+        let tag = unsafe { ((copied.start + at) as *const u32).read_unaligned() };
+        if tag != VIEW_TAG {
+            return;
+        }
+        // The lookup is the one `view` makes for a handle: the slot's own
+        // address.
+        let Some(view) = view(copied.start + at) else {
+            return;
+        };
+        let Some(dwords) = dwords(&view) else {
+            return;
+        };
+        // SAFETY: `at + step` lies inside the copy's mapping (checked
+        // above).
+        let slot =
+            unsafe { std::slice::from_raw_parts_mut(copied.data.add(at as usize), step as usize) };
+        write_dwords(slot, &dwords);
     }
 }
 
@@ -198,6 +239,195 @@ unsafe impl Send for Bytes {}
 // SAFETY: as above.
 #[cfg(windows)]
 unsafe impl Sync for Bytes {}
+
+/// The GFX10 descriptor dwords a [`View`] determines, for the copy of a
+/// heap's memory a shader reads as numbers (see [`Heap::bytes`]): the tag
+/// [`record`] leaves in a slot's first three dwords is not the descriptor.
+///
+/// The layout is the translation's own (`victory-shader`'s
+/// `emit/src/lower.rs`, `descriptor_data` and `descriptor_stride`):
+///
+/// * the base address: dword 0, and dword 1's bits 15:0;
+/// * a buffer's stride: dword 1's bits 29:16 (bits 31:30 are the cache
+///   swizzle, left zero), its record count: dword 2;
+/// * a texture's width - 1: dword 1's bits 31:30 and dword 2's 0-13 (one
+///   field across them), height - 1: dword 2's 14-29, identity swizzle,
+///   type and last level: dword 3, depth or layers - 1: dword 4.
+///
+/// Nothing else is the view's: a descriptor's format words, its tiling
+/// bits, the fields of a constant buffer's size and every sampler field
+/// keep the heap's own bytes, and so does a texture view of a kind the
+/// translation does not name (MSAA, cube) and one naming part of the mip
+/// chain. `None` for a view that says nothing about its descriptor's
+/// dwords.
+fn dwords(view: &View) -> Option<Dwords> {
+    let (address, tail) = match *view {
+        View::Constant(address, _size) => (address, Tail::None),
+        View::Shader(resource, ref desc) => named(resource as This, desc.as_ref())?,
+        View::Unordered(resource, _, ref desc) => named(resource as This, desc.as_ref())?,
+        View::Placed(_, ref resource, ref desc) => placed(resource, desc)?,
+        View::Sampler(_) | View::ConsoleSampler(_) => return None,
+    };
+    Some(Dwords { address, tail })
+}
+
+/// A descriptor's dwords (see [`dwords`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dwords {
+    /// Its base address: dword 0, and dword 1's bits 15:0.
+    address: u64,
+    tail: Tail,
+}
+
+/// The dwords a descriptor holds past its address (see [`dwords`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// Only the address: a constant buffer's size is in no field this view
+    /// names.
+    None,
+    /// A buffer's: its stride, in dword 1's bits 29:16, and its record
+    /// count, in dword 2.
+    Buffer { stride: u32, records: u32 },
+    /// A texture's dimensions, in dwords 2 to 4; dword 3 (the swizzle, the
+    /// type and the last level) only when the view names the type and the
+    /// whole mip chain.
+    Image {
+        width: u32,
+        height: u32,
+        depth: u32,
+        /// The T# type and the last level.
+        levels: Option<(u32, u32)>,
+    },
+}
+
+/// The dwords a shader or unordered access view of `resource` determines.
+fn named(resource: This, words: Option<&[u32; 10]>) -> Option<(u64, Tail)> {
+    if let Some((data, bytes)) = crate::resource::buffer_bytes(resource) {
+        return Some((data as u64, buffer_tail(bytes, words)));
+    }
+    let (data, desc) = crate::resource::texture_memory(resource)?;
+    let described = crate::resource::described(&desc);
+    Some((data as u64, image_tail(&described, words)))
+}
+
+/// The dwords a view of memory without a resource object determines: the
+/// address its description names (dwords 10 and 11) and the fields of its
+/// resource and view descriptions.
+fn placed(resource: &[u32; 14], desc: &[u32; 16]) -> Option<(u64, Tail)> {
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let described = crate::resource::described_words(resource);
+    let words: &[u32; 10] = desc[..10].try_into().ok()?;
+    Some((
+        address,
+        if described.buffer() {
+            // The words' width is a buffer's bytes (see `buffer_range`).
+            buffer_tail(described.width, Some(words))
+        } else {
+            image_tail(&described, Some(words))
+        },
+    ))
+}
+
+/// A buffer view's tail: the record count its description names, else what
+/// the buffer holds, and the stride that scales a record — the view's
+/// structure stride, else its format's element (a typed view's record is
+/// one format unit), else a dword: the raw form a view naming neither (its
+/// format is UNKNOWN, the raw flag's form) is read by.
+fn buffer_tail(bytes: u64, words: Option<&[u32; 10]>) -> Tail {
+    // A buffer view's description: first element, record count, structure
+    // stride and flags, in dwords 2 to 5.
+    let stride = words.map_or(0, |w| if w[4] > 0 { w[4] } else { element_bytes(w[0]) });
+    let stride = if stride > 0 { stride } else { 4 };
+    let declared = words.map_or(0, |w| w[3]);
+    let records = if declared > 0 {
+        declared
+    } else {
+        u32::try_from(bytes / u64::from(stride)).unwrap_or(u32::MAX)
+    };
+    Tail::Buffer { stride, records }
+}
+
+/// A texture view's tail: the resource's dimensions and mip chain, and the
+/// type of image its view dimension names (8 1D, 9 2D, 10 3D, 12 1D array,
+/// 13 2D array — the translation's table — for MSAA and cube ones it names
+/// none).
+fn image_tail(described: &crate::resource::Described, words: Option<&[u32; 10]>) -> Tail {
+    // A texture view's description: format, dimension, then the most
+    // detailed mip and the level count, in dwords 2 and 3.
+    let (kind, whole) = match words {
+        Some(w) => {
+            // D3D12_SRV/UAV_DIMENSION: 2 1D, 3 1D array, 4 2D, 5 2D array,
+            // 8 3D.
+            let kind = match w[1] {
+                2 => 8,
+                4 => 9,
+                8 => 10,
+                3 => 12,
+                5 => 13,
+                _ => 0,
+            };
+            let levels = described.mip_levels;
+            (kind, w[2] == 0 && (w[3] == 0 || w[3] == levels))
+        }
+        // The resource's own view: a plain 1D, 2D or 3D one (an array's is
+        // not named), of its whole chain.
+        None => (
+            match described.dimension {
+                2 => 8,
+                3 if described.depth_or_array_size <= 1 => 9,
+                4 => 10,
+                _ => 0,
+            },
+            true,
+        ),
+    };
+    let levels = (whole && kind != 0).then(|| (kind, described.mip_levels.max(1) - 1));
+    Tail::Image {
+        width: u32::try_from(described.width).unwrap_or(u32::MAX),
+        height: described.height,
+        depth: described.depth_or_array_size,
+        levels,
+    }
+}
+
+/// A view's format as bytes per element; 0 for a format without one (a
+/// raw view's, or one [`crate::resource::element`] does not know).
+fn element_bytes(format: u32) -> u32 {
+    crate::resource::element(crate::resource::pc_format(format))
+        .map_or(0, |(bytes, _)| bytes as u32)
+}
+
+/// Writes `dwords` over `slot`, a copy of a descriptor slot.
+fn write_dwords(slot: &mut [u8], dwords: &Dwords) {
+    let mut put = |at: usize, word: u32| {
+        if let Some(dst) = slot.get_mut(at..at + 4) {
+            dst.copy_from_slice(&word.to_le_bytes());
+        }
+    };
+    let hi = (dwords.address >> 32) as u32 & 0xffff;
+    put(0, dwords.address as u32);
+    match dwords.tail {
+        Tail::None => put(4, hi),
+        Tail::Buffer { stride, records } => {
+            put(4, hi | (stride & 0x3fff) << 16);
+            put(8, records);
+        }
+        Tail::Image {
+            width,
+            height,
+            depth,
+            levels,
+        } => {
+            let (w, h) = (width.max(1) - 1, height.max(1) - 1);
+            put(4, hi | (w & 3) << 30);
+            put(8, (w >> 2) & 0x3fff | (h & 0xffff) << 14);
+            if let Some((kind, last)) = levels {
+                put(12, 0xfac | kind << 28 | (last & 0xff) << 16);
+            }
+            put(16, depth.max(1) - 1);
+        }
+    }
+}
 
 const VIEWS_KIND: u32 = 0;
 const SAMPLERS: u32 = 1;
@@ -849,6 +1079,64 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    /// A slot's copy holds the descriptor's dwords, not our tag: the
+    /// address, a buffer's stride and record count, a texture's size and
+    /// type. What the view does not name keeps the heap's bytes.
+    #[test]
+    fn a_slots_copy_holds_the_descriptors_dwords() {
+        let words = |view: &View| -> [u32; 5] {
+            let mut slot = [0xaau8; 32];
+            write_dwords(&mut slot, &dwords(view).expect("a descriptor's dwords"));
+            let mut out = [0u32; 5];
+            for (i, w) in out.iter_mut().enumerate() {
+                *w = u32::from_le_bytes(slot[4 * i..4 * i + 4].try_into().expect("a dword"));
+            }
+            out
+        };
+        // A constant buffer's address, and only that.
+        let constant = words(&View::Constant(0x7f00_0000_0100, 256));
+        assert_eq!(&constant[..2], &[0x100, 0x7f00]);
+        assert_eq!(&constant[2..], &[0xaaaa_aaaa; 3], "the size is no dword");
+        // A view's words: a description of ten, then the address in dwords
+        // 10 and 11.
+        let at = |address: u64| {
+            let mut view = [0u32; 16];
+            view[10] = address as u32;
+            view[11] = (address >> 32) as u32;
+            view
+        };
+        // A structured view of memory: 100 records of 16 bytes at
+        // 0x7f00_1234_5600, over a buffer description of 0x1000 bytes.
+        let resource = [1, 0, 0, 0, 0x1000, 0, 1, 1, 0, 1, 0, 0, 0, 0];
+        let mut view = at(0x7f00_1234_5600);
+        view[1] = 1; // a buffer
+        view[3] = 100; // its record count
+        view[4] = 16; // its structure stride
+        let structured = words(&View::Placed(false, resource, view));
+        assert_eq!(structured[0], 0x1234_5600);
+        assert_eq!(structured[1], 0x7f00 | 16 << 16, "the stride");
+        assert_eq!(structured[2], 100, "the record count");
+        assert_eq!(
+            &structured[3..],
+            &[0xaaaa_aaaa; 2],
+            "the format words are not the view's"
+        );
+        // A 2D texture of 1024 x 512: the width - 1 spans dword 1's top two
+        // bits and dword 2's low 14, and dword 3 has the type and last level.
+        let resource = [3, 0, 0, 0, 1024, 0, 512, 1, 28, 1, 0, 0, 0, 0];
+        let mut view = at(0x1000);
+        view[0] = 28; // its format
+        view[1] = 4; // a 2D view
+        let texture = words(&View::Placed(false, resource, view));
+        assert_eq!(texture[0], 0x1000);
+        assert_eq!(texture[1], 3 << 30);
+        assert_eq!(texture[2], 0xff | 511 << 14);
+        assert_eq!(texture[3], 0xfac | 9 << 28);
+        // A sampler's four dwords are not a descriptor this can rebuild.
+        assert_eq!(dwords(&View::Sampler([0; 13])), None);
+        assert_eq!(dwords(&View::ConsoleSampler([0; 27])), None);
     }
 
     #[test]

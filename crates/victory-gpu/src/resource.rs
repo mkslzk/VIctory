@@ -292,6 +292,55 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
 /// typeless depth resources.
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
 
+/// A resource description's fields that a descriptor's dwords name, for
+/// the copy of a heap's memory a shader reads as numbers (see
+/// `descriptor::Heap::bytes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Described {
+    /// D3D12_RESOURCE_DIMENSION: buffer 1, 1D 2, 2D 3, 3D 4.
+    pub(crate) dimension: u32,
+    /// A buffer's size in bytes, or a texture's width in texels.
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    /// A texture's depth or array size.
+    pub(crate) depth_or_array_size: u32,
+    /// The mip chain the description has: the full one for 0.
+    pub(crate) mip_levels: u32,
+    /// The DXGI format number.
+    pub(crate) format: u32,
+}
+
+impl Described {
+    fn of(desc: &ResourceDesc) -> Self {
+        Described {
+            dimension: desc.dimension,
+            width: desc.width,
+            height: desc.height,
+            depth_or_array_size: u32::from(desc.depth_or_array_size),
+            mip_levels: mip_count(desc),
+            format: desc.format,
+        }
+    }
+
+    /// Whether the resource is a buffer.
+    pub(crate) fn buffer(&self) -> bool {
+        self.dimension == BUFFER
+    }
+}
+
+/// `desc`'s fields (see [`Described`]).
+pub(crate) fn described(desc: &ResourceDesc) -> Described {
+    Described::of(desc)
+}
+
+/// The fields of the description a placed view's words hold (the same
+/// layout as [`ResourceDesc`], 56 bytes).
+pub(crate) fn described_words(words: &[u32; 14]) -> Described {
+    // SAFETY: 56 bytes in the description's layout, read unaligned.
+    let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    Described::of(&desc)
+}
+
 /// Mip levels, the full chain for 0.
 fn mip_count(desc: &ResourceDesc) -> u32 {
     let depth = if desc.dimension == TEXTURE_3D {
@@ -1494,6 +1543,24 @@ mod tests {
             create(device, 0, &desc, u32::MAX, null, &RESOURCE_IIDS[0], &mut r),
             0
         );
+    }
+
+    /// A placed view's description words are a resource description's
+    /// layout: a draw's descriptor dwords read them (see
+    /// `descriptor::Heap::bytes`).
+    #[test]
+    fn a_description_reads_its_words() {
+        // Dimension, padding, alignment, width (64-bit), height, depth or
+        // array size and levels, format, then samples, quality, layout,
+        // flags.
+        let words = [3, 0, 0, 0, 1024, 0, 512, 1, 28, 1, 0, 0, 0, 0];
+        let d = described_words(&words);
+        assert_eq!((d.dimension, d.width, d.height), (3, 1024, 512));
+        assert_eq!((d.depth_or_array_size, d.mip_levels, d.format), (1, 1, 28));
+        assert!(!d.buffer());
+        // A description naming the full chain gets it counted.
+        assert_eq!(described(&texture(1024, 512, 28, 0)).mip_levels, 11);
+        assert_eq!(described(&buffer(0x1000)).mip_levels, 1);
     }
 
     #[test]
