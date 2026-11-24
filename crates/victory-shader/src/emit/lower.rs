@@ -6960,7 +6960,9 @@ mod tests {
         ];
         for head in bit_tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
-            lowers(&words).unwrap();
+            // These programs ask for nothing beyond the group ID: rsrc2 stays 0,
+            // like the add/sub pair above.
+            lowers(&words, 0).unwrap();
         }
     }
 
