@@ -43,7 +43,12 @@
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
 //!   typed-format loads without an index; structured with the used-resource
 //!   entry's stride when indexed; typed with four 32-bit float channels for
-//!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
+//!   `buffer_load_format_*` and `buffer_store_format_*`. An indexed read of
+//!   a buffer whose stride neither form names is raw too, and reads by byte
+//!   address (the console's raw form). A descriptor the code builds itself
+//!   is read raw and its stride — the STRIDE field of dword 1, bits 29:16 —
+//!   scales the index in the code, since the host has no descriptor to take
+//!   it from. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
 //!   title's view description says. Typed-format loads from heap
