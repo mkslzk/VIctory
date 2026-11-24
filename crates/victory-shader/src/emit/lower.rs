@@ -5673,8 +5673,11 @@ impl<'a> Lower<'a> {
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
-                        .ok_or("a packed input half no element holds")?;
+                    // A half the input's layout has no element for reads as
+                    // zero, like the whole-dword read below: the program keeps
+                    // its pipeline instead of stopping for one missing half.
+                    let z = self.s.m.i32(0);
+                    let lo = half(self, h + u8::from(attribute.high))?.unwrap_or(z);
                     self.low_half(inst, reg, lo)
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
