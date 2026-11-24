@@ -35,6 +35,9 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    /// Whether the shader reads the window onto the descriptor heap's
+    /// memory (see [`Shader::title_handle`]).
+    pub title: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -612,19 +615,22 @@ impl<'a> Lower<'a> {
             return Err("a global load result");
         };
         let c = self.cur;
-        let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
-            off = self.s.m.bin(c, Bin::Add, off, d);
+        // The byte offset into what the handle is bound over: a root SRV
+        // starts at the address the title set, the window onto a heap at
+        // the heap's start (see `built_offset`).
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let (base, extra) = self.built_offset(&src)?;
+        let mut off = self.s.m.i32(base);
+        if let Some(x) = extra {
+            off = self.s.m.bin(c, Bin::Add, off, x);
         }
         let h = if a.param == CODE {
             None
         } else {
-            let src = Source::Built {
-                address: a,
-                bits: 0,
-                words: [0, 0],
-            };
             Some(self.handle((b, i), &src, false, (11, 0))?)
         };
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
@@ -906,11 +912,13 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let title = self.s.title.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            title,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2977,9 +2985,13 @@ impl<'a> Lower<'a> {
         };
         let Some((at, first)) = use_at else {
             // The program never uses the descriptor as an image or a buffer: it
-            // reads its dwords as numbers, which on the console is just title
-            // memory. Read them from there instead of rebuilding fields from a
-            // host view - the bytes are exactly what the title wrote.
+            // reads its dwords as numbers, which on the console is just
+            // memory. A root descriptor's dwords are title memory; a heap
+            // descriptor's are the heap's, read through the window onto it
+            // (see [`Self::handle`]). shortcut: a heap slot's first three
+            // dwords hold the runtime's view tag (`record` in
+            // victory-gpu's descriptor.rs), so those read as the tag rather
+            // than as what the title wrote.
             let Some(address) = self.scalar.get(&site).copied() else {
                 return Err("an untracked descriptor load");
             };
@@ -2988,10 +3000,13 @@ impl<'a> Lower<'a> {
                 bits: 0,
                 words: [0, 0],
             };
+            let (base, extra) = self.built_offset(&built)?;
             let h = self.handle(site, &built, false, (11, 0))?;
             for k in 0..count {
-                let byte = address.offset + 4 * k;
-                let off = self.s.m.i32(byte);
+                let mut off = self.s.m.i32(base + 4 * k);
+                if let Some(x) = extra {
+                    off = self.s.m.bin(self.cur, Bin::Add, off, x);
+                }
                 let u = self.s.m.undef(self.s.t.i32);
                 let mask = self.s.m.i8(1);
                 let align = self.s.m.i32(4);
@@ -3303,14 +3318,30 @@ impl<'a> Lower<'a> {
     }
 
     /// The byte offset a buffer descriptor built around a root descriptor adds
-    /// (constant and computed parts); none for other descriptors.
+    /// (constant and computed parts); none for other descriptors. A table in
+    /// a descriptor heap adds its own place in the heap (the runtime's
+    /// user-data value), since the heap's memory is what its loads read.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
-                let x = match address.dynamic {
+                let mut x = match address.dynamic {
                     Some(v) => Some(self.i32_of(v)?),
                     None => None,
                 };
+                let param = address.param;
+                if matches!(
+                    self.x.native.layout.get(param).map(|p| p.root),
+                    Some(RootType::Table)
+                ) {
+                    let Val::I32(base) = self.user(param, 0) else {
+                        return Err("a table's place in its heap");
+                    };
+                    let c = self.cur;
+                    x = Some(match x {
+                        Some(x) => self.s.m.bin(c, Bin::Add, base, x),
+                        None => base,
+                    });
+                }
                 Ok((address.offset, x))
             }
             _ => Ok((0, None)),
@@ -3422,6 +3453,20 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
+                    // A descriptor out of a descriptor heap, read as
+                    // numbers: no root descriptor points at its dwords, so
+                    // they come from the heap's memory, which the window
+                    // on it (see [`Shader::title_handle`]) makes readable.
+                    // A heap root parameter's user data is 0 (its loads
+                    // count from the heap's start), and a table's is its
+                    // place in the heap. A table of samplers keeps the
+                    // error: those descriptors live in the other bound
+                    // heap.
+                    (
+                        RootType::Table | RootType::ResourceHeap,
+                        Some(ResourceType::Srv | ResourceType::Uav),
+                        11,
+                    ) => Ok(self.s.title_handle()),
                     _ => Err("a root UAV or typed root view"),
                 }
             }
@@ -7595,6 +7640,80 @@ mod tests {
             _ => (1024 + m) as f32 * 2f32.powi(e as i32 - 25),
         };
         if s == 1 { -v } else { v }
+    }
+
+    /// A descriptor the code reads only as numbers, loaded from a table (a
+    /// descriptor heap): its dwords are the heap's bytes, which no root
+    /// descriptor points at. The program needs the dword (a branch on it),
+    /// so the read has to come from the heap's memory.
+    #[test]
+    fn a_heap_descriptor_read_only_as_numbers_comes_from_the_heap_memory() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            0x8000_8100, // s_add_u32 s0, s0, 1
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> s_endpgm
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 9,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 9,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        assert!(
+            lowered.is_ok(),
+            "a heap descriptor read only as numbers should come from the heap's memory: {:?}",
+            lowered.err()
+        );
+        assert!(
+            lowered.unwrap().title,
+            "the shader reads the window onto the heap's memory"
+        );
     }
 
     #[test]

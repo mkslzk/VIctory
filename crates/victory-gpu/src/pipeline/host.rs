@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, TITLE_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -273,6 +273,10 @@ pub(crate) struct HostPipeline {
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
+    /// The root parameter of the window onto the descriptor heap's memory
+    /// (`t0` in `TITLE_SPACE`), which its shaders read heap descriptor
+    /// dwords through.
+    pub(crate) title: u32,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
 }
@@ -434,6 +438,23 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // The window onto the descriptor heap's memory: every host root
+        // signature declares it, since a translated shader that reads a
+        // heap descriptor's dwords binds `t0` in `TITLE_SPACE`
+        // (`victory_shader::emit::Shader::title_handle`). Its contents are
+        // only needed for those shaders (see `Draw::bind`).
+        let title = params.len() as u32;
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: TITLE_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -484,6 +505,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                title,
             });
         }
         let Some(g) = g else {
@@ -516,6 +538,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                title,
             });
         }
 
@@ -586,6 +609,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            title,
         })
     }
 }

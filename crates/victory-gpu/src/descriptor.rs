@@ -13,6 +13,9 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -64,6 +67,10 @@ pub(crate) struct Heap {
     /// memory itself (see [`resync_title_writes`]).
     #[cfg(windows)]
     synced: std::sync::atomic::AtomicU64,
+    /// The heap's memory for shaders that read its descriptors' dwords as
+    /// numbers, made on first use (see [`Heap::bytes`]).
+    #[cfg(windows)]
+    copied: std::sync::OnceLock<Option<Bytes>>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -111,7 +118,86 @@ impl Heap {
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
     }
+
+    /// The heap's memory in a host buffer, with its GPU address: what the
+    /// window at `TITLE_SPACE` binds, so that a shader reading a
+    /// descriptor's dwords as numbers reads the heap's bytes. The GPU
+    /// cannot read the title's memory here, so this is a copy, made on
+    /// first use and kept in step with every descriptor write through our
+    /// methods (`record`, `copy_simple`) and with the title's own writes
+    /// that [`resync_title_writes`] sees. A title that rewrites a slot in
+    /// our own memory without a call of ours goes unseen, as its writes
+    /// there already do for the host heap.
+    #[cfg(windows)]
+    pub(crate) fn bytes(&self) -> Option<(ID3D12Resource, u64)> {
+        let step = u64::from(increment(self.desc.kind)?);
+        let len = step * u64::from(self.desc.count.max(1));
+        let copied = self.copied.get_or_init(|| {
+            let (buffer, data) =
+                crate::host::host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+            crate::host::name(&buffer, || {
+                format!("descriptor heap {:#x}+{len:#x}", self.start)
+            });
+            // SAFETY: a live buffer, and `len` bytes at `start` (the heap's
+            // memory: ours, or the title's in the placement it gave).
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            unsafe { std::ptr::copy_nonoverlapping(self.start as *const u8, data, len as usize) };
+            Some(Bytes {
+                buffer,
+                data,
+                gpu,
+                start: self.start,
+                len,
+            })
+        });
+        let copied = copied.as_ref()?;
+        Some((copied.buffer.clone(), copied.gpu))
+    }
+
+    /// Copies the heap's slot `index` into the copy of its memory, if one
+    /// was made: the descriptor changed.
+    #[cfg(windows)]
+    fn copy_slot(&self, index: u32, step: u64) {
+        let Some(Some(copied)) = self.copied.get() else {
+            return;
+        };
+        let at = u64::from(index) * step;
+        if at + step > copied.len {
+            return;
+        }
+        // SAFETY: both ranges inside live memory: the heap's, and the
+        // copy's mapping. Writes to one slot race the title's own writes to
+        // it, as our tags in that memory already do.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (copied.start + at) as *const u8,
+                copied.data.add(at as usize),
+                step as usize,
+            )
+        };
+    }
 }
+
+/// A copy of a shader-visible heap's memory (see [`Heap::bytes`]).
+#[cfg(windows)]
+struct Bytes {
+    buffer: ID3D12Resource,
+    /// The buffer's mapping: written with the heap's bytes.
+    data: *mut u8,
+    /// The buffer's GPU address.
+    gpu: u64,
+    /// Where the copy starts in the heap, and how long it is.
+    start: u64,
+    len: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
+// written only for slots that change.
+#[cfg(windows)]
+unsafe impl Send for Bytes {}
+// SAFETY: as above.
+#[cfg(windows)]
+unsafe impl Sync for Bytes {}
 
 const VIEWS_KIND: u32 = 0;
 const SAMPLERS: u32 = 1;
@@ -141,6 +227,10 @@ fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
+    // The descriptor's bytes changed: its heap's copy of them follows.
+    if let Some(step) = increment(heap.desc.kind) {
+        heap.copy_slot(index, u64::from(step));
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -190,6 +280,8 @@ pub(crate) fn resync_title_writes() {
                 let i = i as u32;
                 if i < heap.desc.count {
                     host.mirror(i, start + u64::from(i) * step, false);
+                    // What the shader reads as a number follows too.
+                    heap.copy_slot(i, step);
                 }
             }
         }
@@ -674,6 +766,8 @@ pub(crate) extern "system" fn create_heap(
         pending: Default::default(),
         #[cfg(windows)]
         synced: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(windows)]
+        copied: std::sync::OnceLock::new(),
     });
     #[cfg(windows)]
     if visible {

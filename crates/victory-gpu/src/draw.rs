@@ -522,7 +522,46 @@ impl State {
                 }
             }
         }
+        // The window onto the descriptor heap's memory, which a shader
+        // reading a heap descriptor's dwords as numbers binds (see
+        // `victory_shader::emit::TITLE_SPACE`).
+        self.bind_title(list, compute, p);
         true
+    }
+
+    /// Binds the window onto the descriptor heap's memory: the bytes of the
+    /// bound view heap, for a pipeline whose shaders read a heap
+    /// descriptor's dwords as numbers. Any other pipeline gets a buffer of
+    /// zeros, so the parameter never holds another draw's address.
+    fn bind_title(&mut self, list: &HostList, compute: bool, p: &HostPipeline) {
+        let reads = p.stages.iter().any(|s| s.translated().host.title);
+        let bytes = if reads && self.heaps[0] != 0 {
+            crate::descriptor::heap(self.heaps[0] as This).bytes()
+        } else {
+            None
+        };
+        let gpu = match bytes {
+            Some((buffer, gpu)) => {
+                list.keep(&buffer);
+                gpu
+            }
+            None => {
+                if reads {
+                    once!(
+                        "a shader reads the descriptor heap's dwords with no heap bound: zeros"
+                    );
+                }
+                zeros()
+            }
+        };
+        // SAFETY: an open list, and a live buffer's GPU address.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootShaderResourceView(p.title, gpu);
+            } else {
+                list.list.SetGraphicsRootShaderResourceView(p.title, gpu);
+            }
+        }
     }
 
     /// Binds the title's root SRV `slot` as the one-view table `param` (see
@@ -1171,6 +1210,23 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
     Some(signature)
+}
+
+/// The GPU address of a buffer of zeros: what the window onto the
+/// descriptor heap's memory holds for a pipeline that does not read it.
+fn zeros() -> u64 {
+    static ZEROS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    ZEROS
+        .get_or_init(|| {
+            const LEN: usize = 1 << 16;
+            let (buffer, data) = crate::host::host()?.shared_buffer(LEN as u64)?;
+            // SAFETY: the first `LEN` bytes of the mapping.
+            unsafe { std::ptr::write_bytes(data, 0, LEN) };
+            crate::host::name(&buffer, || "zeros for the heap window".into());
+            // SAFETY: a live buffer.
+            Some(unsafe { buffer.GetGPUVirtualAddress() })
+        })
+        .unwrap_or(0)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
