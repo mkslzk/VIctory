@@ -49,6 +49,9 @@ pub(crate) struct Mesh {
 
 pub(crate) struct Shader {
     pub m: Module,
+    /// Test builds: typed loads assembled from a dword-aligned pair.
+    #[cfg(test)]
+    pub unaligned_typed_loads: u32,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -101,6 +104,9 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
+            #[cfg(test)]
+            #[cfg(test)]
+            unaligned_typed_loads: 0,
             t: Types {
                 void,
                 i1,
