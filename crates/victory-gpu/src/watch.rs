@@ -47,6 +47,13 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked_now: Vec::new(),
 });
 
+/// `VICTORY_NO_WATCH`: the write watch is skipped entirely. Measurement only:
+/// frames then show whatever the host copy already held, which can be stale.
+fn no_watch() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("VICTORY_NO_WATCH").is_some())
+}
+
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
 fn on_wine() -> bool {
     static WINE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -81,6 +88,12 @@ pub(crate) fn new_submission() {
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    // Measurement switch: no watching at all. The GPU then reads whatever the
+    // host copy already held, so frames can be wrong; it exists to price the
+    // watch itself against the rest of a frame.
+    if no_watch() {
+        return None;
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
