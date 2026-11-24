@@ -2976,7 +2976,38 @@ impl<'a> Lower<'a> {
             }
         };
         let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+            // The program never uses the descriptor as an image or a buffer: it
+            // reads its dwords as numbers, which on the console is just title
+            // memory. Read them from there instead of rebuilding fields from a
+            // host view - the bytes are exactly what the title wrote.
+            let Some(address) = self.scalar.get(&site).copied() else {
+                return Err("an untracked descriptor load");
+            };
+            let built = Source::Built {
+                address,
+                bits: 0,
+                words: [0, 0],
+            };
+            let h = self.handle(site, &built, false, (11, 0))?;
+            for k in 0..count {
+                let byte = address.offset + 4 * k;
+                let off = self.s.m.i32(byte);
+                let u = self.s.m.undef(self.s.t.i32);
+                let mask = self.s.m.i8(1);
+                let align = self.s.m.i32(4);
+                let r = self.s.op(
+                    self.cur,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, off, u, mask, align],
+                );
+                let x = self.s.m.extract(self.cur, r, 0);
+                let dst = Reg::S(code + k as u8);
+                self.write(inst, dst, x, None);
+            }
+            return Ok(());
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -7731,5 +7762,71 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+    }
+
+    /// A descriptor the code never uses as an image or a buffer: on the
+    /// console its dwords come from title memory, so reading numbers out of
+    /// them must not stop the program. Today it stops with "a descriptor read
+    /// only as data".
+    #[test]
+    fn a_descriptor_read_only_as_numbers_comes_from_title_memory() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            0x8000_8100, // s_add_u32 s0, s0, 1
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 9,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 9,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        assert!(
+            lowered.is_ok(),
+            "a descriptor read only as numbers should come from title memory: {:?}",
+            lowered.err()
+        );
     }
 }
