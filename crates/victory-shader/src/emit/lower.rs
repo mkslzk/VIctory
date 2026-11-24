@@ -43,6 +43,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The props each buffer handle was declared with (kind, stride).
+    #[cfg(test)]
+    pub views: Vec<(u32, u32)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -95,6 +98,13 @@ enum Numeric {
     Uint,
     Sint,
     Float,
+}
+
+/// The STRIDE field of a GFX10 buffer descriptor's dword 1: bytes per
+/// record, in bits 29:16 (bits 31:30 hold the cache swizzle, 15:0 the top
+/// of the base address). Zero for a descriptor without a structure stride.
+fn descriptor_stride(bits: u32) -> u32 {
+    bits >> 16 & 0x3FFF
 }
 
 /// A GFX10 buffer format (the unified format of typed buffer loads): the
@@ -174,6 +184,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// The props each buffer handle was declared with (kind, stride).
+    #[cfg(test)]
+    views: Vec<(u32, u32)>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -479,6 +492,8 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            #[cfg(test)]
+            views: Vec::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -910,6 +925,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            views: self.views,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3298,6 +3315,60 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// The structure stride of the buffer `src` reads by index: what the
+    /// used-resource entry records for a descriptor in a table, and the
+    /// STRIDE field of dword 1 for a descriptor the code builds itself
+    /// (GFX10 buffer descriptors carry it in bits 29:16). `None` for a buffer
+    /// without one, which the program addresses by byte.
+    fn buffer_stride(&self, src: &Source) -> Option<u32> {
+        let stride = match src {
+            Source::Built { bits, .. } => descriptor_stride(*bits),
+            _ => self.used_kind(src).map_or(0, |u| u.stride),
+        };
+        (stride >= 4 && stride.is_multiple_of(4)).then_some(stride)
+    }
+
+    /// The handle of the buffer `src` reads at element `index` (byte offset
+    /// `off`), and the (index, offset) operands for it.
+    ///
+    /// A descriptor in a table becomes a structured view of its stride. A
+    /// descriptor the code builds is bound raw: the host has no descriptor
+    /// to take a stride from, so the stride scales the index here. A buffer
+    /// neither names a stride for is read by byte address, as the unindexed
+    /// accesses already read such buffers (the console's raw form, where the
+    /// descriptor's stride is one byte).
+    fn indexed_buffer(
+        &mut self,
+        site: Site,
+        src: &Source,
+        u: u32,
+        index: V,
+        off: V,
+    ) -> Result<(V, V, V), Why> {
+        let c = self.cur;
+        match self.buffer_stride(src) {
+            Some(stride) if matches!(src, Source::Built { .. }) => {
+                let s = self.s.m.i32(stride);
+                let at = self.s.m.bin(c, Bin::Mul, index, s);
+                let at = self.s.m.bin(c, Bin::Add, at, off);
+                let h = self.handle(site, src, false, (11 | u, 0))?;
+                Ok((h, at, self.s.m.undef(self.s.t.i32)))
+            }
+            Some(stride) => {
+                let h = self.handle(site, src, false, (12 | u, stride))?;
+                Ok((h, index, off))
+            }
+            None => {
+                let at = match off {
+                    V::Const(0) => index,
+                    _ => self.s.m.bin(c, Bin::Add, index, off),
+                };
+                let h = self.handle(site, src, false, (11 | u, 0))?;
+                Ok((h, at, self.s.m.undef(self.s.t.i32)))
+            }
+        }
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -3306,6 +3377,10 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        #[cfg(test)]
+        if !sampler {
+            self.views.push(props);
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props.0);
@@ -6277,12 +6352,8 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    let (h, at, at_off) = self.indexed_buffer(site, src, u, index, off)?;
+                    (h, [at, at_off, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -6360,12 +6431,9 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
+                        let (h, at, at_off) = self.indexed_buffer(site, src, u, index, off)?;
+                        args.push(h);
+                        args.extend([at, at_off]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -6421,18 +6489,14 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let (h, at, at_off) = self.indexed_buffer(site, src, u, index, off)?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, index, off, mask, align],
+                        &[h, at, at_off, mask, align],
                     )
                 }
                 None => {
@@ -7197,7 +7261,89 @@ mod tests {
                 slot: 0,
             }]
         };
-        lower_with(&words, layout(), used()).unwrap();
+        let l = lower_with(&words, layout(), used()).unwrap();
+        assert!(!l.views.is_empty());
+        assert!(
+            l.views.iter().all(|&v| v == (12, 4)),
+            "a structured view of the recorded stride: {:?}",
+            l.views
+        );
+    }
+
+    #[test]
+    fn an_indexed_buffer_without_a_recorded_stride_reads_by_byte_address() {
+        // The same program as the test above, with the table's entry
+        // recording no stride: the access reads the buffer by byte address,
+        // as the unindexed accesses do, instead of being refused.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF408_0302,
+            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
+            0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
+            0xE030_2000,
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&words, layout, used).unwrap();
+        assert!(!l.views.is_empty());
+        assert!(
+            l.views.iter().all(|&v| v == (11, 0)),
+            "a raw view: no stride to declare: {:?}",
+            l.views
+        );
+    }
+
+    #[test]
+    fn an_indexed_root_descriptor_takes_its_stride_from_its_dword_1() {
+        // s16..s19: a buffer descriptor built around the root SRV's address
+        // with a stride of 16 (0x10 in dword 1's stride bits), loaded by
+        // index. The host binds a root SRV raw, so the stride scales the
+        // index in the code rather than in a view.
+        let words = [
+            0xBE90_0300, // s_mov_b32 s16, s0
+            0x8811_FF01,
+            0x0010_0000, // s_or_b32 s17, s1, 0x100000
+            0xBE92_03C1, // s_mov_b32 s18, -1
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0xE030_2000,
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], used).unwrap();
+        // Bound raw, with the stride scaled in the code.
+        assert!(!l.views.is_empty());
+        assert!(l.views.iter().all(|&v| v == (11, 0)), "{:?}", l.views);
+        assert_eq!(l.root_srvs, [0]);
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
